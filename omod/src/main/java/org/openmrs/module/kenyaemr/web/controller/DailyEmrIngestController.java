@@ -16,6 +16,25 @@ import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.ResponseBody;
 
 import javax.servlet.http.HttpServletRequest;
+import org.openmrs.api.context.Context;
+import org.openmrs.Patient;
+import org.openmrs.PersonName;
+import org.openmrs.PatientIdentifier;
+import org.openmrs.PatientIdentifierType;
+import org.openmrs.api.PatientService;
+import org.openmrs.api.EncounterService;
+import org.openmrs.api.ObsService;
+import org.openmrs.Encounter;
+import org.openmrs.Obs;
+import org.openmrs.EncounterType;
+import org.openmrs.Location;
+import org.openmrs.module.metadatadeploy.MetadataUtils;
+import org.openmrs.module.kenyaemr.Metadata;
+import org.openmrs.module.kenyaemr.CommonMetadata;
+import org.openmrs.module.kenyaemr.util.FhirIngestParser;
+import org.openmrs.module.kenyaemr.util.FhirIngestParser.ParsedObservation;
+import org.openmrs.module.kenyaemr.util.FhirIngestParser.ParsedPatient;
+import org.openmrs.module.kenyaemr.KenyaEmrService;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.InputStream;
@@ -51,27 +70,21 @@ public class DailyEmrIngestController extends BaseRestController {
             byte[] bytes = in.readAllBytes();
             String body = new String(bytes, StandardCharsets.UTF_8);
 
-            // Try to parse minimal JSON metadata (patient id, entry count)
+            // Parse minimal metadata using helper parser (keeps parsing logic testable)
             String patientRef = null;
             int entryCount = 0;
+            ParsedPatient parsedPatient = null;
+            List<ParsedObservation> parsedObservations = null;
             try {
                 com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
                 com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(body);
                 if (root.has("entry") && root.get("entry").isArray()) {
                     entryCount = root.get("entry").size();
-                    for (com.fasterxml.jackson.databind.JsonNode e : root.get("entry")) {
-                        if (e.has("resource") && e.get("resource").has("resourceType") && "Patient".equals(e.get("resource").get("resourceType").asText())) {
-                            com.fasterxml.jackson.databind.JsonNode p = e.get("resource");
-                            if (p.has("id")) {
-                                patientRef = p.get("id").asText();
-                            } else if (p.has("identifier") && p.get("identifier").isArray() && p.get("identifier").size() > 0) {
-                                com.fasterxml.jackson.databind.JsonNode idn = p.get("identifier").get(0);
-                                if (idn.has("value")) patientRef = idn.get("value").asText();
-                            }
-                            break;
-                        }
-                    }
                 }
+
+                parsedPatient = FhirIngestParser.parsePatient(body);
+                parsedObservations = FhirIngestParser.parseObservations(body);
+                if (parsedPatient != null && parsedPatient.id != null) patientRef = parsedPatient.id;
             } catch (Exception ex) {
                 log.warn("Failed to parse FHIR bundle JSON metadata", ex);
             }
@@ -87,6 +100,125 @@ public class DailyEmrIngestController extends BaseRestController {
             }
 
             log.info("Received FHIR bundle (entries=" + entryCount + ") patient=" + patientRef + " wrote to " + filename);
+
+            // Attempt to persist minimal resources into OpenMRS: Patient -> Encounter -> Obs
+            try {
+                PatientService patientService = Context.getPatientService();
+                EncounterService encounterService = Context.getEncounterService();
+                ObsService obsService = Context.getObsService();
+                KenyaEmrService kenyaEmr = Context.getService(KenyaEmrService.class);
+                Location defaultLocation = kenyaEmr.getDefaultLocation();
+
+                Patient patient = null;
+                if (patientRef != null) {
+                    List<Patient> found = patientService.getPatients(null, patientRef, null, false);
+                    if (found != null && !found.isEmpty()) patient = found.get(0);
+                }
+
+                if (patient == null && parsedPatient != null) {
+                    patient = new Patient();
+                    if (parsedPatient.given != null || parsedPatient.family != null) {
+                        PersonName name = new PersonName();
+                        name.setGivenName(parsedPatient.given);
+                        name.setFamilyName(parsedPatient.family);
+                        patient.addName(name);
+                    }
+                    if (parsedPatient.gender != null) patient.setGender(parsedPatient.gender);
+                    if (parsedPatient.birthDate != null) {
+                        try {
+                            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd");
+                            patient.setBirthdate(sdf.parse(parsedPatient.birthDate));
+                        } catch (Exception ignore) {}
+                    }
+
+                    // Add identifier using OPENMRS_ID identifier type if available
+                    try {
+                        PatientIdentifierType idType = MetadataUtils.existing(PatientIdentifierType.class, CommonMetadata._PatientIdentifierType.OPENMRS_ID);
+                        if (patientRef != null && idType != null) {
+                            PatientIdentifier pid = new PatientIdentifier(patientRef, idType, defaultLocation);
+                            patient.addIdentifier(pid);
+                        }
+                    } catch (Exception ex) {
+                        // ignore identifier creation failures
+                    }
+
+                    patient = patientService.savePatient(patient);
+                }
+
+                if (patient != null && parsedObservations != null && !parsedObservations.isEmpty()) {
+                    // create a simple encounter
+                    Encounter enc = new Encounter();
+                    enc.setPatient(patient);
+                    enc.setEncounterDatetime(new java.util.Date());
+                    enc.setLocation(defaultLocation);
+                    // pick a sensible encounter type if available
+                    try {
+                        EncounterType et = null;
+                        List<EncounterType> ets = encounterService.getAllEncounterTypes();
+                        if (ets != null && !ets.isEmpty()) et = ets.get(0);
+                        if (et != null) enc.setEncounterType(et);
+                    } catch (Exception ex) {
+                        // ignore
+                    }
+
+                    enc = encounterService.saveEncounter(enc);
+
+                    // Save observations as simple obs linked to the encounter
+                    for (ParsedObservation po : parsedObservations) {
+                        try {
+                            Obs o = new Obs();
+                            o.setPerson(patient);
+                            o.setEncounter(enc);
+                            o.setObsDatetime(new java.util.Date());
+                            o.setLocation(defaultLocation);
+
+                            // crude mapping by text
+                            String t = po.codeText == null ? "" : po.codeText.toLowerCase();
+                            if (t.contains("weight")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.WEIGHT_KG));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("height")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.HEIGHT_CM));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("systolic")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5085AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("diastolic")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5086AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("pulse") || t.contains("heart rate")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5087AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("temperature") || t.contains("temp")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5088AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("respiratory")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5242AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else if (t.contains("oxygen") || t.contains("o2")) {
+                                o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept("5092AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                            } else {
+                                // fallback: store as text obs with a generic concept if available
+                                try {
+                                    o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.OTHER_SPECIFY));
+                                    if (po.valueString != null) o.setValueText(po.valueString);
+                                    else if (po.valueNumeric != null) o.setValueNumeric(po.valueNumeric);
+                                } catch (Exception ex) {
+                                    // last fallback: skip obs
+                                    continue;
+                                }
+                            }
+
+                            obsService.saveObs(o, "DailyEMR ingest");
+                        } catch (Exception ex) {
+                            log.warn("Failed to save parsed observation", ex);
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                log.warn("OpenMRS persistence of FHIR bundle failed", ex);
+            }
 
             return new ResponseEntity<String>("OK", new HttpHeaders(), HttpStatus.OK);
         } catch (Exception e) {
