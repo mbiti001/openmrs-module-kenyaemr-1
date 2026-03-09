@@ -84,6 +84,10 @@ public class DailyEmrIngestController extends BaseRestController {
 
                 parsedPatient = FhirIngestParser.parsePatient(body);
                 parsedObservations = FhirIngestParser.parseObservations(body);
+                // parse additional resources
+                List<FhirIngestParser.ParsedServiceRequest> serviceRequests = FhirIngestParser.parseServiceRequests(body);
+                List<FhirIngestParser.ParsedDiagnosticReport> diagnosticReports = FhirIngestParser.parseDiagnosticReports(body);
+                List<FhirIngestParser.ParsedMedication> medications = FhirIngestParser.parseMedications(body);
                 if (parsedPatient != null && parsedPatient.id != null) patientRef = parsedPatient.id;
             } catch (Exception ex) {
                 log.warn("Failed to parse FHIR bundle JSON metadata", ex);
@@ -214,6 +218,92 @@ public class DailyEmrIngestController extends BaseRestController {
                         } catch (Exception ex) {
                             log.warn("Failed to save parsed observation", ex);
                         }
+                    }
+                    }
+
+                    // Persist service requests, diagnostic reports and medications as text obs attached to the same encounter
+                    try {
+                        if (patient != null) {
+                            // ensure we have an encounter (create one if missing from above)
+                            Encounter encToUse = null;
+                            try {
+                                List<Encounter> patientEncounters = Context.getEncounterService().getEncountersByPatient(patient);
+                                if (patientEncounters != null && !patientEncounters.isEmpty()) encToUse = patientEncounters.get(0);
+                            } catch (Exception ex) {}
+
+                            if (encToUse == null) {
+                                encToUse = new Encounter();
+                                encToUse.setPatient(patient);
+                                encToUse.setEncounterDatetime(new java.util.Date());
+                                encToUse.setLocation(defaultLocation);
+                                try {
+                                    EncounterType et = null;
+                                    List<EncounterType> ets = Context.getEncounterService().getAllEncounterTypes();
+                                    if (ets != null && !ets.isEmpty()) et = ets.get(0);
+                                    if (et != null) encToUse.setEncounterType(et);
+                                } catch (Exception ex) {}
+                                encToUse = Context.getEncounterService().saveEncounter(encToUse);
+                            }
+
+                            // ServiceRequests
+                            if (serviceRequests != null) {
+                                for (FhirIngestParser.ParsedServiceRequest sr : serviceRequests) {
+                                    try {
+                                        Obs o = new Obs();
+                                        o.setPerson(patient);
+                                        o.setEncounter(encToUse);
+                                        o.setObsDatetime(new java.util.Date());
+                                        o.setLocation(defaultLocation);
+                                        o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.OTHER_SPECIFY));
+                                        String text = "ServiceRequest: " + (sr.codeText == null ? "(unknown)" : sr.codeText) + " authoredOn=" + sr.authoredOn;
+                                        o.setValueText(text);
+                                        Context.getObsService().saveObs(o, "DailyEMR ingest");
+                                    } catch (Exception ex) {
+                                        log.warn("Failed to save service request as obs", ex);
+                                    }
+                                }
+                            }
+
+                            // DiagnosticReports
+                            if (diagnosticReports != null) {
+                                for (FhirIngestParser.ParsedDiagnosticReport dr : diagnosticReports) {
+                                    try {
+                                        Obs o = new Obs();
+                                        o.setPerson(patient);
+                                        o.setEncounter(encToUse);
+                                        o.setObsDatetime(new java.util.Date());
+                                        o.setLocation(defaultLocation);
+                                        o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.OTHER_SPECIFY));
+                                        String text = "DiagnosticReport: status=" + dr.status + " conclusion=" + dr.conclusion;
+                                        o.setValueText(text);
+                                        Context.getObsService().saveObs(o, "DailyEMR ingest");
+                                    } catch (Exception ex) {
+                                        log.warn("Failed to save diagnostic report as obs", ex);
+                                    }
+                                }
+                            }
+
+                            // Medications
+                            if (medications != null) {
+                                for (FhirIngestParser.ParsedMedication m : medications) {
+                                    try {
+                                        Obs o = new Obs();
+                                        o.setPerson(patient);
+                                        o.setEncounter(encToUse);
+                                        o.setObsDatetime(new java.util.Date());
+                                        o.setLocation(defaultLocation);
+                                        o.setConcept(org.openmrs.module.kenyaemr.Dictionary.getConcept(Metadata.Concept.OTHER_SPECIFY));
+                                        String text = "Medication: " + (m.medicationText == null ? "(unknown)" : m.medicationText) + " status=" + m.status;
+                                        o.setValueText(text);
+                                        Context.getObsService().saveObs(o, "DailyEMR ingest");
+                                    } catch (Exception ex) {
+                                        log.warn("Failed to save medication as obs", ex);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception ex) {
+                        log.warn("Failed to persist additional FHIR resources", ex);
                     }
                 }
             } catch (Exception ex) {

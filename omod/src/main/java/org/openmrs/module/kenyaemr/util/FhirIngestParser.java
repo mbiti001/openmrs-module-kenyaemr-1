@@ -29,6 +29,24 @@ public class FhirIngestParser {
         public String unit;
     }
 
+    public static class ParsedServiceRequest {
+        public String id;
+        public String codeText;
+        public String authoredOn;
+    }
+
+    public static class ParsedDiagnosticReport {
+        public String id;
+        public String status;
+        public String conclusion;
+    }
+
+    public static class ParsedMedication {
+        public String id;
+        public String medicationText;
+        public String status;
+    }
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static ParsedPatient parsePatient(String bundleJson) throws Exception {
@@ -117,6 +135,82 @@ public class FhirIngestParser {
                 }
 
                 out.add(o);
+            }
+        }
+
+        return out;
+    }
+
+    public static List<ParsedServiceRequest> parseServiceRequests(String bundleJson) throws Exception {
+        List<ParsedServiceRequest> out = new ArrayList<ParsedServiceRequest>();
+        JsonNode root = MAPPER.readTree(bundleJson);
+        if (!root.has("entry") || !root.get("entry").isArray()) return out;
+
+        for (JsonNode e : root.get("entry")) {
+            JsonNode res = e.get("resource");
+            if (res != null && res.has("resourceType") && "ServiceRequest".equals(res.get("resourceType").asText())) {
+                ParsedServiceRequest r = new ParsedServiceRequest();
+                if (res.has("id")) r.id = res.get("id").asText();
+                if (res.has("code")) {
+                    JsonNode code = res.get("code");
+                    if (code.has("text")) r.codeText = code.get("text").asText();
+                    else if (code.has("coding") && code.get("coding").isArray() && code.get("coding").size() > 0) {
+                        JsonNode c0 = code.get("coding").get(0);
+                        if (c0.has("display")) r.codeText = c0.get("display").asText();
+                    }
+                }
+                if (res.has("authoredOn")) r.authoredOn = res.get("authoredOn").asText();
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
+    public static List<ParsedDiagnosticReport> parseDiagnosticReports(String bundleJson) throws Exception {
+        List<ParsedDiagnosticReport> out = new ArrayList<ParsedDiagnosticReport>();
+        JsonNode root = MAPPER.readTree(bundleJson);
+        if (!root.has("entry") || !root.get("entry").isArray()) return out;
+
+        for (JsonNode e : root.get("entry")) {
+            JsonNode res = e.get("resource");
+            if (res != null && res.has("resourceType") && "DiagnosticReport".equals(res.get("resourceType").asText())) {
+                ParsedDiagnosticReport r = new ParsedDiagnosticReport();
+                if (res.has("id")) r.id = res.get("id").asText();
+                if (res.has("status")) r.status = res.get("status").asText();
+                if (res.has("conclusion")) r.conclusion = res.get("conclusion").asText();
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
+    public static List<ParsedMedication> parseMedications(String bundleJson) throws Exception {
+        List<ParsedMedication> out = new ArrayList<ParsedMedication>();
+        JsonNode root = MAPPER.readTree(bundleJson);
+        if (!root.has("entry") || !root.get("entry").isArray()) return out;
+
+        for (JsonNode e : root.get("entry")) {
+            JsonNode res = e.get("resource");
+            if (res != null && res.has("resourceType")) {
+                String rt = res.get("resourceType").asText();
+                if ("MedicationRequest".equals(rt) || "MedicationDispense".equals(rt) || "MedicationStatement".equals(rt)) {
+                    ParsedMedication m = new ParsedMedication();
+                    if (res.has("id")) m.id = res.get("id").asText();
+                    if (res.has("status")) m.status = res.get("status").asText();
+                    if (res.has("medicationCodeableConcept")) {
+                        JsonNode mc = res.get("medicationCodeableConcept");
+                        if (mc.has("text")) m.medicationText = mc.get("text").asText();
+                        else if (mc.has("coding") && mc.get("coding").isArray() && mc.get("coding").size() > 0) {
+                            JsonNode c0 = mc.get("coding").get(0);
+                            if (c0.has("display")) m.medicationText = c0.get("display").asText();
+                        }
+                    } else if (res.has("medicationReference")) {
+                        JsonNode mr = res.get("medicationReference");
+                        if (mr.has("display")) m.medicationText = mr.get("display").asText();
+                        else if (mr.has("reference")) m.medicationText = mr.get("reference").asText();
+                    }
+                    out.add(m);
+                }
             }
         }
 
